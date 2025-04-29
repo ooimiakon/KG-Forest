@@ -125,10 +125,49 @@ def search_entities_with_optional_relations(
 
     return all_results
 
+def rank_chunks_by_similarity(
+    kg_builder,
+    query_text: str,
+    chunk_ids: List[str],
+    top_k: int = 10
+) -> List[Dict]:
+    """
+    Given a query and chunk IDs, return the top-k most similar chunks based on cosine similarity.
+
+    Returns:
+        List of dicts with keys: chunk_id, text, embedding, similarity
+    """
+    # Step 1: Embed the query
+    query_vec = kg_builder.entity_embedder.encode(
+        query_text,
+        normalize_embeddings=True,
+        convert_to_numpy=True
+    ).astype(np.float32)
+
+    results = []
+
+    for cid in chunk_ids:
+        chunk_vec = kg_builder.embeddings.get(cid)
+        if chunk_vec is None:
+            continue
+
+        similarity = np.dot(query_vec, chunk_vec) / (
+            np.linalg.norm(query_vec) * np.linalg.norm(chunk_vec)
+        )
+
+        results.append({
+            "chunk_id": cid,
+            "embedding": chunk_vec,
+            "similarity": similarity
+        })
+
+    # Step 2: Sort by similarity and return top-k
+    return sorted(results, key=lambda x: x["similarity"], reverse=True)[:top_k]
+
 
 if __name__ == "__main__":
     # chane this for 
-    #query = "Which organizations were associated with the group of breast cancer patients?"
+    query = "Which organizations were associated with the group of breast cancer patients?"
     #entities, relations = extract_entities_and_relations(query)
 
     #hard coded for testing
@@ -147,3 +186,36 @@ if __name__ == "__main__":
     print("\nSearch Results:")
     for ent_name, chunk_ids in results:
         print(f"{ent_name}: {chunk_ids}")
+    # Step 2: flatten and dedupe chunk IDs
+    all_chunk_ids = list({cid for _, chunk_list in results for cid in chunk_list})
+    top_chunks = rank_chunks_by_similarity(
+    kg_builder,
+    query_text= query,
+    chunk_ids=all_chunk_ids,
+    top_k=10
+    )
+
+    # 4. Print
+    for chunk in top_chunks:
+        print(f"[{chunk['chunk_id']}] similarity={chunk['similarity']:.3f}")
+
+    '''
+Search Results:
+breast cancer patients: ['MED-10#2']
+breast cancer: ['MED-10#1']
+breast cancer diagnosis: ['MED-14#2']
+cohort of 17,880 breast cancer patients: ['MED-14#0']
+breast cancer patients: ['MED-10#0']
+cohort of 17,880 breast cancer patients: ['MED-14#0']
+breast cancer: ['MED-14#1']
+breast cancer diagnosis: ['MED-14#2']
+breast cancer patients: ['MED-10#0']
+breast cancer: ['MED-10#1']
+breast cancer diagnosis: ['MED-14#2']
+cohort of 17,880 breast cancer patients: ['MED-14#0']
+[MED-14#0] similarity=0.412
+[MED-10#0] similarity=0.411
+[MED-14#1] similarity=0.385
+[MED-14#2] similarity=0.377
+[MED-10#1] similarity=0.333
+[MED-10#2] similarity=0.323'''

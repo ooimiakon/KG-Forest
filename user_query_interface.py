@@ -18,7 +18,7 @@ from sentence_transformers import SentenceTransformer
 from kg_forest import KGProcessor
 from kg_forest import RelationExtractor
 STORAGE_PATH = "data"
-API_KEY = ""
+API_KEY = "sk-2c14fbdaec1645189872267405e3d6a5"
 BASE_URL = "https://api.deepseek.com/v1"
 
 EMB = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")

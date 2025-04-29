@@ -345,3 +345,18 @@ class MultiLevelIndex:
                 results.append((similar_entity_name, list(chunk_ids)))
                 
         return results
+    def find_chunks_for_entity(self, entity_name: str) -> List[str]:
+        entity_id = self.entity_name_to_id.get(entity_name)
+        if entity_id is None:
+            print(f"Entity {entity_name} not found in index.")
+            return []
+        
+        all_chunk_ids = set()
+        relation_ids = self.entity_to_relations.get(entity_id, set())
+        for rel_id in relation_ids:
+            chunks = self.entity_relation_to_chunks.get((entity_id, rel_id), set())
+            all_chunk_ids.update(chunks)
+        standalone_chunks = self.entity_relation_to_chunks.get((entity_id, -1), set())
+        all_chunk_ids.update(standalone_chunks)
+        
+        return list(all_chunk_ids)

@@ -110,6 +110,13 @@ class DeepSeekExtractor:
                     "2) Extract relations as triples {source_entity, relation, target_entity, relation_description};\n"
                     "3) Self-audit: review your own output and add any missing items.\n"
                     "Return exactly a JSON matching the tool schema."
+                    "-Always output at least one relation for the main action or verb implied by the question\n"
+                    "Example:\n"
+                        "Input: \"Who works for Acme Corp?\n"
+                        "Entities: \n"
+                            "  - { entity_name: \"Acme Corp\", entity_type: \"Organization\", entity_description: \"Company mentioned in query\" }\n"
+                        "Relations:\n"
+                            "  - { source_entity: \"Unknown person\", relation: \"works_for\", target_entity: \"Acme Corp\", relation_description: \"Person is employed by Acme Corp\" }\n"
                 )
             },
             {
@@ -323,6 +330,7 @@ class KnowledgeGraphBuilder:
         # 转换为实体名称和分数
         results = []
         for entity_id, distance in zip(entity_ids[0], distances[0]):
+            entity_id = int(entity_id)  # 确保是整数
             entity_name = self.index.entity_id_to_name[entity_id]
             score = 1.0 / (1.0 + distance)  # 将距离转换为相似度分数
             results.append((entity_name, score))
@@ -364,6 +372,79 @@ class KnowledgeGraphBuilder:
         net.show_buttons(['physics'])
         net.write_html(output_file)
         print(f"Knowledge graph saved to {output_file}")
+    
+    def save_graph(self, path_prefix: str):
+        """Save metadata and FAISS index to disk"""
+        import pickle
+        import faiss
+
+        metadata = {
+            "chunk_meta": self.chunk_meta,
+            "extractions": self.extractions,
+            "embeddings": self.embeddings,
+            "entity_name_to_id": self.index.entity_name_to_id,
+            "entity_id_to_name": self.index.entity_id_to_name,
+            "relation_name_to_id": self.index.relation_name_to_id,
+            "entity_vectors": self.index.entity_vectors,
+            "relation_vectors": self.index.relation_vectors,
+            "entity_to_relations": self.index.entity_to_relations,
+            "entity_relation_to_chunks": self.index.entity_relation_to_chunks,
+        }
+        import os
+        os.makedirs(os.path.dirname(path_prefix), exist_ok=True)
+
+        with open(f"{path_prefix}.pkl", "wb") as f:
+            pickle.dump(metadata, f)
+        print(f"[✓] Saved metadata to {path_prefix}.pkl")
+
+        if self.index.entity_index is not None:
+            faiss.write_index(self.index.entity_index, f"{path_prefix}.faiss")
+            print(f"[✓] Saved FAISS index to {path_prefix}.faiss")
+        else:
+            print("Warning: No FAISS index to save.")
+    
+    # load graph
+    @staticmethod
+    def load_graph(api_key: str, path_prefix: str) -> KnowledgeGraphBuilder:
+        """
+        Load a previously saved KnowledgeGraphBuilder from disk.
+        
+        Args:
+            api_key: DeepSeek API key.
+            path_prefix: Path prefix used when saving the graph (e.g., "saved/graph").
+        
+        Returns:
+            A fully restored KnowledgeGraphBuilder instance.
+        """
+        import pickle
+        import faiss
+
+        # Step 1: Create an empty instance
+        kg_builder = KnowledgeGraphBuilder(api_key=api_key)
+
+        # Step 2: Load metadata
+        with open(f"{path_prefix}.pkl", "rb") as f:
+            metadata = pickle.load(f)
+
+        # Step 3: Restore internal state
+        kg_builder.chunk_meta = metadata["chunk_meta"]
+        kg_builder.extractions = metadata["extractions"]
+        kg_builder.embeddings = metadata["embeddings"]
+        kg_builder.index.entity_name_to_id = metadata["entity_name_to_id"]
+        kg_builder.index.entity_id_to_name = metadata["entity_id_to_name"]
+        kg_builder.index.relation_name_to_id = metadata["relation_name_to_id"]
+        kg_builder.index.entity_vectors = metadata["entity_vectors"]
+        kg_builder.index.relation_vectors = metadata["relation_vectors"]
+        kg_builder.index.entity_to_relations = metadata["entity_to_relations"]
+        kg_builder.index.entity_relation_to_chunks = metadata["entity_relation_to_chunks"]
+
+        # Step 4: Load FAISS index
+        kg_builder.index.entity_index = faiss.read_index(f"{path_prefix}.faiss")
+
+        print(f"[✓] Knowledge graph loaded from {path_prefix}.pkl and {path_prefix}.faiss")
+        return kg_builder
+
+
 
 def main():
     """主函数：演示如何使用知识图谱构建系统"""
@@ -389,12 +470,16 @@ def main():
     
     # 构建索引
     kg_builder.build_index()
-    
+    chunks = kg_builder.index.find_chunks_for_entity("statins")
+    print(f"Chunks for 'statins': {chunks}")
     # 可视化知识图谱
     kg_builder.visualize()
+    # Save the built knowledge graph
+    kg_builder.save_graph("saved/graph")
+
     
     # 测试查询
-    query = "What is the main topic of the documents?"
+    query = "Which organizations were associated with the group of breast cancer patients?"
     results = kg_builder.query_graph(query)
     print(f"Query: {query}")
     print("Results:", results)

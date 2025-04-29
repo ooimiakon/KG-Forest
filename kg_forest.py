@@ -42,6 +42,93 @@ class KnowledgeGraph:
         self.entity_name_to_id = {}  # entity_name -> entity_id
         self.relation_triples = set()  # (source_id, relation, target_id)
 
+    def lookup_entity_attribute(self, entity_name: str, attribute_name: Optional[str] = None) -> Any:
+        """根据实体名称和属性名称查找实体的属性值"""
+        entity_id = self.entity_name_to_id.get(entity_name)
+        if entity_id is None:
+            return "Entity not found."
+        
+        entity = self.entities.get(entity_id)
+        if entity is None:
+            return "Entity not found."
+        
+        attributes = {
+            "name": entity.name,
+            "type": entity.type,
+            "description": entity.description
+        }
+        
+        if attribute_name is None:
+            return attributes
+        else:
+            value = attributes.get(attribute_name)
+            if value is not None:
+                return {attribute_name: value}
+            else:
+                return {f"Attribute '{attribute_name}' not found in '{entity.name}'": attributes}
+    
+    def lookup_entity_relation(self, entity_name: str, relation_name: Optional[str] = None) -> List[Tuple[str, str]]:
+        """
+        Lookup related target entities given an entity and optional relation.
+        
+        Returns a list of (relation, target_entity_name) pairs:
+        - If relation_name is given, returns only matching relations.
+        - If relation_name is None, returns all relations under the entity.
+        - If entity not found, returns an empty list.
+        """
+        results = []
+        entity_id = self.entity_name_to_id.get(entity_name)
+        if entity_id is None:
+            print(f"Entity '{entity_name}' not found.")
+            return results
+        
+        for src_id, relation, tgt_id in self.relation_triples:
+            if src_id == entity_id:
+                target_entity = self.entities.get(tgt_id)
+                if target_entity:
+                    results.append(("outgoing", relation, target_entity.name))
+            elif tgt_id == entity_id:
+                source_entity = self.entities.get(src_id)
+                if source_entity:
+                    results.append(("incoming", relation, source_entity.name))
+        
+        if not results:
+            print(f"No relations found for entity '{entity_name}'.")
+        
+        return results
+    def print_entity_relations(self):
+        """Print all relations for each entity: outgoing and incoming."""
+        for eid, entity in self.entities.items():
+            print(f"\nEntity: {entity.name} (ID: {eid})")
+
+            outgoing = []
+            incoming = []
+
+            for src_id, relation, tgt_id in self.relation_triples:
+                if src_id == eid:
+                    target_entity = self.entities.get(tgt_id)
+                    if target_entity:
+                        outgoing.append((relation, target_entity.name))
+                elif tgt_id == eid:
+                    source_entity = self.entities.get(src_id)
+                    if source_entity:
+                        incoming.append((relation, source_entity.name))
+            
+            if outgoing:
+                print("  Outgoing Relations:")
+                for relation, target in outgoing:
+                    print(f"    {relation} -> {target}")
+            else:
+                print("  Outgoing Relations: None")
+
+            if incoming:
+                print("  Incoming Relations:")
+                for relation, source in incoming:
+                    print(f"    {relation} <- {source}")
+            else:
+                print("  Incoming Relations: None")
+
+
 class TextProcessor:
     def __init__(self, chunk_size: int = 600):
         self.chunk_size = chunk_size
@@ -120,6 +207,13 @@ class RelationExtractor:
                     "2) Extract relations as triples {source_entity, relation, target_entity, relation_description};\n"
                     "3) Self-audit: review your own output and add any missing items.\n"
                     "Return exactly a JSON matching the tool schema."
+                    "-Always output at least one relation for the main action or verb implied by the question\n"
+                    "Example:\n"
+                        "Input: \"Who works for Acme Corp?\n"
+                        "Entities: \n"
+                            "  - { entity_name: \"Acme Corp\", entity_type: \"Organization\", entity_description: \"Company mentioned in query\" }\n"
+                        "Relations:\n"
+                            "  - { source_entity: \"Unknown person\", relation: \"works_for\", target_entity: \"Acme Corp\", relation_description: \"Person is employed by Acme Corp\" }\n"
                 )
             },
             {
@@ -319,13 +413,13 @@ class KGStorage:
         
         # 2. 计算关系向量 (Q4)并保存到全局存储
         attr_dir = self.storage_path / "attributes"
-        attr_vecs = torch.zeros((len(self.attr2aid), self.dim), dtype=torch.int8)
+        self.attr_vecs = torch.zeros((len(self.attr2aid), self.dim), dtype=torch.int8)
         for pred, aid in self.attr2aid.items():
             vec = self.emb_model.encode(pred, normalize_embeddings=True, convert_to_tensor=True)
-            attr_vecs[aid] = self.quant_tensor(vec.cpu(), bits=4)
+            self.attr_vecs[aid] = self.quant_tensor(vec.cpu(), bits=4)
         
         # 保存全局属性向量
-        np.save(attr_dir / "embeddings.npy", attr_vecs.numpy())
+        np.save(attr_dir / "embeddings.npy", self.attr_vecs.numpy())
     
     def detect_communities(self):
         """使用 Leiden 算法检测社区"""
@@ -617,6 +711,7 @@ class KGProcessor:
         self.relation_extractor = RelationExtractor(api_key, base_url)
         self.storage = GraphStorage(storage_path)
         self.kg = self.storage.load_graph()
+        
         self.kg_storage = KGStorage(storage_path)
         
         # 用于存储文档的嵌入向量
@@ -709,6 +804,42 @@ class KGProcessor:
         
         # 6. 生成可视化
         return self.kg_storage.visualize()
+    
+    def print_all_entities(kg):
+        for eid, entity in kg.entities.items():
+            print(f"{eid}: {entity.name}")
+    
+    def lookup_relation_chunk_embeddings(self, entity_name: str, relation_name: Optional[str] = None) -> List[Tuple[str, str, np.ndarray]]:
+        results = []
+        
+        entity_name_lower = entity_name.lower().strip()
+        cid = self.kg_storage.concept2cid.get(entity_name_lower)
+        if cid is None:
+            print(f"Concept for entity '{entity_name}' not found.")
+            return results
+
+        if relation_name:
+            aid = self.kg_storage.attr2aid.get(relation_name.lower())
+            if aid is None:
+                print(f"Relation '{relation_name}' not found.")
+                return results
+        else:
+            aid = None
+
+        for h, a, t, chunk_id in self.kg_storage.triples:
+            if (h == cid or t == cid) and (aid is None or a == aid):
+                chunk_embedding = self.chunk_embeddings.get(chunk_id)
+                if chunk_embedding is not None:
+                    relation_str = list(self.kg_storage.attr2aid.keys())[list(self.kg_storage.attr2aid.values()).index(a)]
+                    direction = "outgoing" if h == cid else "incoming"
+                    results.append((direction, relation_str, chunk_embedding))
+        
+        if not results:
+            print(f"No chunk embeddings found for entity '{entity_name}' with relation '{relation_name}'.")
+
+        return results
+
+
 
 def main():
     # 配置
@@ -729,15 +860,19 @@ def main():
 
     # 初始化处理器
     processor = KGProcessor(STORAGE_PATH, API_KEY, BASE_URL)
-
+    processor.kg.print_entity_relations()
     # 处理文档
     for doc_id, record in corpus.items():
         logging.info(f"Processing document: {doc_id}")
         processor.process_document(doc_id, record["text"])
     
+    KGProcessor.print_all_entities(processor.kg)
+    
     # 生成知识图谱可视化
     output_file = processor.finalize()
     logging.info(f"Knowledge graph visualization generated: {output_file}")
+
+    
 
 if __name__ == "__main__":
     main() 

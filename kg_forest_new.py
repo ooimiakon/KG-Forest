@@ -306,7 +306,9 @@ class KnowledgeGraphBuilder:
                 chunk_id,
                 extraction,
                 self.entity_embedder,
-                self.relation_embedder
+                self.relation_embedder,
+                incremental=False,  # 首次建库不走增量逻辑
+                auto_flush=False    # 批量结束后再 flush
             )
         logging.info(f"Building index with {len(self.extractions)} data points...")
         self.index.build_faiss_indices()

@@ -4,8 +4,7 @@ from beir import util
 from beir.datasets.data_loader import GenericDataLoader
 import random
 import logging
-from kg_forest_new import TextProcessor, KnowledgeGraphBuilder
-from kg_forest_new import ChunkExtraction
+from kg_forest_new import TextProcessor, KnowledgeGraphBuilder, Entity, Relation, ChunkExtraction
 from typing import Dict, Set, Tuple
 
 # 配置日志
@@ -96,7 +95,7 @@ def print_entities_and_relations(entities: Set[Tuple[str, str, str]], relations:
 
 def update(tasks):
     """
-    将从“云端”同步下来的 tasks（每个对应一个 chunk）：
+    将从"云端"同步下来的 tasks（每个对应一个 chunk）：
       - 注册到 kg_builder 的内存结构
       - 把实体/关系插入到多级索引里
       - 最后重建 FAISS 索引
@@ -129,13 +128,16 @@ def update(tasks):
             chunk_id,
             chunk_kg,
             entity_embedder=kg_builder.entity_embedder,
-            relation_embedder=kg_builder.relation_embedder
+            relation_embedder=kg_builder.relation_embedder,
+            incremental=True,      # 使用增量方式添加向量
+            auto_flush=False       # 批量结束后再 flush
         )
     
-    # 3) 重新构建 FAISS 索引，以包含新加入的实体向量
-    kg_builder.build_index()
+    # 3) 一次性把新增向量写进 FAISS
+    if getattr(kg_builder.index, "_new_vecs", None):
+        kg_builder.index._flush_new_vectors()   # 内部会 build 或 add
     
-    logging.info(f"Updated local KG with {len(tasks)} new chunks and rebuilt FAISS index.")
+    logging.info(f"Updated local KG with {len(tasks)} new chunks.")
     # （可选）持久化到磁盘
     # kg_builder.save_graph("saved/graph")
     # 更新后状态

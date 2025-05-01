@@ -7,6 +7,7 @@ import faiss
 faiss.omp_set_num_threads(1)
 import logging
 from collections import defaultdict
+import threading
 
 # 使用 TYPE_CHECKING 避免循环导入
 if TYPE_CHECKING:
@@ -50,6 +51,11 @@ class MultiLevelIndex:
         # FAISS索引
         self.entity_index = None
         
+        # 线程安全
+        self._entity_vectors_lock = threading.Lock()
+        self._new_vecs_lock = threading.Lock()
+        self._index_lock = threading.Lock()
+        
     def get_or_create_entity_id(self, entity_name: str) -> Tuple[int, bool]:
         """
         获取或创建实体ID
@@ -87,9 +93,10 @@ class MultiLevelIndex:
     
     def add_entity_vector(self, entity_id: int, vector: np.ndarray):
         """添加实体向量"""
-        while len(self.entity_vectors) <= entity_id:
-            self.entity_vectors.append(np.zeros(vector.shape[0], dtype=np.float32))
-        self.entity_vectors[entity_id] = vector
+        with self._entity_vectors_lock:
+            while len(self.entity_vectors) <= entity_id:
+                self.entity_vectors.append(np.zeros(vector.shape[0], dtype=np.float32))
+            self.entity_vectors[entity_id] = vector
     
     def add_relation_vector(self, relation_id: int, vector: np.ndarray):
         """添加关系向量"""
@@ -97,6 +104,40 @@ class MultiLevelIndex:
             self.relation_vectors.append(np.zeros(vector.shape[0], dtype=np.float32))
         self.relation_vectors[relation_id] = vector
     
+    # ---------- ① 记录待插入向量 ----------
+    def _queue_new_entity(self, eid: int, vec: np.ndarray) -> None:
+        """把新实体向量暂存到一个队列里，等批量 add 到 FAISS。"""
+        with self._new_vecs_lock:
+            if not hasattr(self, "_new_vecs"):
+                self._new_vecs = []          # [(id, vec), …]
+            self._new_vecs.append((eid, vec))
+
+    # ---------- ② 与 FAISS 同步 ----------
+    def _flush_new_vectors(self) -> None:
+        """把 _new_vecs 中的向量按 id 顺序写入 entity_vectors 并 add() 到索引。"""
+        if not getattr(self, "_new_vecs", None):
+            return
+
+        # 先按 id 排序，保证顺序一致
+        with self._new_vecs_lock:
+            self._new_vecs.sort(key=lambda x: x[0])
+            vecs_to_add = []
+            for eid, vec in self._new_vecs:
+                self.add_entity_vector(eid, vec)  # 写入列表（保证 len 对应 id）
+                vecs_to_add.append(vec)
+            self._new_vecs.clear()   # 清空
+
+        if not vecs_to_add:
+            return
+
+        vecs_to_add = np.asarray(vecs_to_add, dtype=np.float32)
+        with self._index_lock:
+            if self.entity_index is None:
+                # 索引还没建——说明是第一次增量调用
+                self.build_faiss_indices()
+            else:
+                self.entity_index.add(vecs_to_add)
+
     def add_entity_relation(self, entity_id: int, relation_id: int):
         """添加实体-关系关联"""
         self.entity_to_relations[entity_id].add(relation_id)
@@ -140,7 +181,8 @@ class MultiLevelIndex:
         logging.info(f"Built FAISS index for {len(vectors)} entity vectors")
     
     def process_chunk_extraction(self, chunk_id: str, extraction: "ChunkExtraction", 
-                                 entity_embedder=None, relation_embedder=None):
+                                 entity_embedder=None, relation_embedder=None, *, 
+                                 incremental: bool=True, auto_flush: bool=True):
         """
         处理ChunkExtraction对象，提取实体和关系并添加到索引中
         
@@ -149,6 +191,8 @@ class MultiLevelIndex:
             extraction: ChunkExtraction对象
             entity_embedder: 用于生成实体向量的嵌入模型
             relation_embedder: 用于生成关系向量的嵌入模型
+            incremental: 是否使用增量方式添加向量
+            auto_flush: 是否在处理完chunk后自动同步向量到FAISS
         """
         logging.info(f"\nProcessing chunk {chunk_id}:")
         logging.info(f"Found {len(extraction.entities)} entities and {len(extraction.relations)} relations")
@@ -173,6 +217,26 @@ class MultiLevelIndex:
             relation_entities.add(source_id)
             relation_entities.add(target_id)
             
+            # ----- 新增实体向量 -----
+            if entity_embedder is not None:
+                if is_new_source:
+                    src_vec = entity_embedder.encode(
+                        relation.source_entity, normalize_embeddings=True,
+                        convert_to_numpy=True).astype(np.float32)
+                    if incremental and self.entity_index is not None:
+                        self._queue_new_entity(source_id, src_vec)
+                    else:
+                        self.add_entity_vector(source_id, src_vec)
+
+                if is_new_target:
+                    tgt_vec = entity_embedder.encode(
+                        relation.target_entity, normalize_embeddings=True,
+                        convert_to_numpy=True).astype(np.float32)
+                    if incremental and self.entity_index is not None:
+                        self._queue_new_entity(target_id, tgt_vec)
+                    else:
+                        self.add_entity_vector(target_id, tgt_vec)
+            
             # 如果提供了关系嵌入模型，且是新关系，生成关系向量
             if relation_embedder is not None and is_new_relation:
                 relation_vector = relation_embedder.encode(
@@ -181,24 +245,6 @@ class MultiLevelIndex:
                     convert_to_numpy=True
                 ).astype(np.float32)
                 self.add_relation_vector(relation_id, relation_vector)
-            
-            # 如果提供了实体嵌入模型，且是新实体，分别生成实体向量
-            if entity_embedder is not None:
-                if is_new_source:
-                    source_vector = entity_embedder.encode(
-                        relation.source_entity,
-                        normalize_embeddings=True,
-                        convert_to_numpy=True
-                    ).astype(np.float32)
-                    self.add_entity_vector(source_id, source_vector)
-                
-                if is_new_target:
-                    target_vector = entity_embedder.encode(
-                        relation.target_entity,
-                        normalize_embeddings=True,
-                        convert_to_numpy=True
-                    ).astype(np.float32)
-                    self.add_entity_vector(target_id, target_vector)
             
             # 添加关系-实体到chunk的引用
             self.add_chunk_reference(source_id, relation_id, chunk_id)
@@ -220,10 +266,20 @@ class MultiLevelIndex:
                     normalize_embeddings=True,
                     convert_to_numpy=True
                 ).astype(np.float32)
-                self.add_entity_vector(entity_id, entity_vector)
+                if incremental and self.entity_index is not None:
+                    self._queue_new_entity(entity_id, entity_vector)
+                else:
+                    self.add_entity_vector(entity_id, entity_vector)
             
             # 添加实体到chunk的引用（无关系时 relation_id=-1）
             self.add_chunk_reference(entity_id, -1, chunk_id)
+        
+        # ---------- 同步到 FAISS ----------
+        if incremental and auto_flush:
+            # 若首次增量调用而 self.entity_index 还不存在
+            if self.entity_index is None and getattr(self, "_new_vecs", None):
+                self.build_faiss_indices()          # train + add 旧向量
+            self._flush_new_vectors()               # 追加新向量
         
         logging.info(f"Finished processing chunk {chunk_id}")
         logging.info(f"Current total entities: {len(self.entity_name_to_id)}")

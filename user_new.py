@@ -7,14 +7,14 @@ from kg_forest_new import KnowledgeGraphBuilder, DeepSeekExtractor, Entity, Rela
 import numpy as np
 import sys
 
-API_KEY = ""
+API_KEY = "sk-2c14fbdaec1645189872267405e3d6a5"
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 BASE_URL = "https://api.deepseek.com/v1"
 # use this when dynamic creating kg
 #kg_builder = KnowledgeGraphBuilder(api_key=API_KEY, model_name=MODEL_NAME)
 
 # for saved
-kg_builder = KnowledgeGraphBuilder.load_graph(api_key=API_KEY, path_prefix="saved/graph_fiqa")
+kg_builder = KnowledgeGraphBuilder.load_graph(api_key=API_KEY, path_prefix="saved/graph")
 
 rel_extractor = kg_builder.extractor
 rel_extractor.client = openai.OpenAI(api_key=API_KEY, base_url=BASE_URL)
@@ -73,19 +73,12 @@ def search_entities_with_optional_relations(
     kg_builder: KnowledgeGraphBuilder,
     entities: List[Dict[str, str]],
     relations: Optional[List[Dict[str, str]]] = None,
-    top_k: int = 10
+    top_k: int = 10,
+    max_hops: int = 3,                # 新增参数：最多跳数，默认2跳
 ) -> List[Tuple[str, List[str]]]:
     """
-    Search for relevant chunks using entities and optionally relations.
-
-    Args:
-        kg_builder: The KnowledgeGraphBuilder instance with built index.
-        entities: List of entity dictionaries from extraction.
-        relations: Optional list of relation dictionaries from extraction.
-        top_k: Top-k similar entities to return.
-
-    Returns:
-        A list of (entity_name, [matching chunk_ids])
+    Search for relevant chunks using entities and optionally relations,
+    with up to max_hops hops.
     """
     entity_embedder = kg_builder.entity_embedder
     relation_embedder = kg_builder.relation_embedder
@@ -94,31 +87,51 @@ def search_entities_with_optional_relations(
     all_results = []
 
     for ent in entities:
-        ent_name = ent["entity_name"]
-        ent_vec = entity_embedder.encode(
-            ent_name, normalize_embeddings=True, convert_to_numpy=True
-        ).astype(np.float32)
-
+        start_entity = ent["entity_name"]
         combined_chunk_ids = set()
+        # frontier 存放当前 hop 要搜索的实体名
+        frontier = [start_entity]
+        visited = {start_entity}
 
-        # 1. Run entity + relation search (if relation available)
-        if relations:
-            rel = next((r for r in relations if r["target_entity"] == ent_name), None)
-            if rel:
-                rel_vec = relation_embedder.encode(
-                    rel["relation"], normalize_embeddings=True, convert_to_numpy=True
+        for hop in range(max_hops):
+            next_frontier = []
+            for ent_name in frontier:
+                # embedding
+                ent_vec = entity_embedder.encode(
+                    ent_name,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True
                 ).astype(np.float32)
-                relation_results = index.search_by_name(ent_vec, rel_vec, top_k=top_k)
-                for _, chunk_list in relation_results:
+
+                # 第一跳时，同时做 relation 搜索
+                if hop == 0 and relations:
+                    rel = next((r for r in relations if r["target_entity"] == ent_name), None)
+                    if rel:
+                        rel_vec = relation_embedder.encode(
+                            rel["relation"],
+                            normalize_embeddings=True,
+                            convert_to_numpy=True
+                        ).astype(np.float32)
+                        for _, chunk_list in index.search_by_name(ent_vec, rel_vec, top_k=top_k):
+                            combined_chunk_ids.update(chunk_list)
+
+                # 实体-only 搜索
+                for _, chunk_list in index.search(ent_vec, top_k=top_k):
                     combined_chunk_ids.update(chunk_list)
 
-        # 2. Run entity-only search (ALWAYS)
-        entity_results = index.search(ent_vec, top_k=top_k) #always run index.search() for entity-only results → this guarantees you capture relation_id == -1 cases
-        for _, chunk_list in entity_results:
-            combined_chunk_ids.update(chunk_list)
+                # 为下一跳收集实体（基于所有提取到的 relations）
+                if relations:
+                    for r in relations:
+                        if r["source_entity"] == ent_name and r["target_entity"] not in visited:
+                            visited.add(r["target_entity"])
+                            next_frontier.append(r["target_entity"])
 
-        # 3. Add combined results
-        all_results.append((ent_name, list(combined_chunk_ids)))
+            # 下一跳
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        all_results.append((start_entity, list(combined_chunk_ids)))
 
     return all_results
 

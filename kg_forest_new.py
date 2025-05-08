@@ -219,7 +219,7 @@ class DeepSeekExtractor:
                 result = json.loads(resp.choices[0].message.tool_calls[0].function.arguments)
                 return ChunkExtraction(
                     entities=[Entity(**e) for e in result["entities"]],
-                    relations=[Relation(**r) for r in result["relations"]]
+                    relations=[Relation(**{k: v for k, v in r.items() if k in {'source_entity', 'relation', 'target_entity', 'relation_description'}}) for r in result["relations"]]
                 )
             raise Exception("No tool calls in response")
         except Exception as e:
@@ -306,9 +306,7 @@ class KnowledgeGraphBuilder:
                 chunk_id,
                 extraction,
                 self.entity_embedder,
-                self.relation_embedder,
-                incremental=False,  # 首次建库不走增量逻辑
-                auto_flush=False    # 批量结束后再 flush
+                self.relation_embedder
             )
         logging.info(f"Building index with {len(self.extractions)} data points...")
         self.index.build_faiss_indices()
@@ -460,6 +458,7 @@ def main():
     kg_builder = KnowledgeGraphBuilder(api_key=api_key)
     
     # 加载数据
+    '''
     DATASET = "nfcorpus"
     url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{DATASET}.zip"
     out_dir = os.path.join(os.getcwd(), "datasets")
@@ -469,19 +468,36 @@ def main():
     # 处理文档（示例只处理前3个文档）
     for doc_id, record in list(corpus.items())[:3]:
         kg_builder.process_document(doc_id, record["text"])
+    '''
+    corpus_file = "./fiqa/corpus.jsonl"
+    max_docs = 200
+    with open(corpus_file, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):  # start counter at 1
+            if i > max_docs:
+                break
+            record = json.loads(line)
+            doc_id = record["_id"]
+            text = record["text"]
+            kg_builder.process_document(doc_id, text)
+            
+            if i % 1000 == 0:
+                print(f"Processed {i} documents...")
+
+
+    
     
     # 构建索引
     kg_builder.build_index()
-    chunks = kg_builder.index.find_chunks_for_entity("statins")
-    print(f"Chunks for 'statins': {chunks}")
+    #chunks = kg_builder.index.find_chunks_for_entity("statins")
+    #print(f"Chunks for 'statins': {chunks}")
     # 可视化知识图谱
     kg_builder.visualize()
     # Save the built knowledge graph
-    kg_builder.save_graph("saved/graph")
+    kg_builder.save_graph("saved/graph_fiqa")
 
     
     # 测试查询
-    query = "Which organizations were associated with the group of breast cancer patients?"
+    query = "Requirements for filing business taxes?"
     results = kg_builder.query_graph(query)
     print(f"Query: {query}")
     print("Results:", results)

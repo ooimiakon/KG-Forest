@@ -173,7 +173,7 @@ def main():
         logger.info("Document processed successfully")
         
         # 处理文本并构建知识图谱
-        kg.process_text(clean_doc["text"], clean_doc["id"])
+        kg.process_text(clean_doc["text"], clean_doc["id"], title=clean_doc["title"])
         
         # 创建任务
         tasks = create_tasks(clean_doc, text_processor, kg)

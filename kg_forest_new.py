@@ -4,16 +4,18 @@ import json
 import re
 import logging
 import numpy as np
-import networkx as nx
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Tuple
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
 import openai
 from sentence_transformers import SentenceTransformer
-from beir import util
-from beir.datasets.data_loader import GenericDataLoader
 from pyvis.network import Network
-from kg_index import MultiLevelIndex, IndexConfig
+from kg_index import MultiLevelIndex
+import faiss
+import pickle
+
+# Global variables
+API_KEY = ""
+MAX_PROCESSED_SAMPLES = 3  # Maximum number of samples to process
 
 # Set environment variables to avoid conflicts
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -244,18 +246,20 @@ class KnowledgeGraphBuilder:
         self.extractions: Dict[str, ChunkExtraction] = {}  # chunk_id -> 抽取结果
         self.embeddings: Dict[str, np.ndarray] = {}  # chunk_id -> 文本嵌入向量
     
-    def process_text(self, text: str, doc_id: str) -> List[ChunkExtraction]:
+    def process_text(self, text: str, doc_id: str, title: str = None) -> List[ChunkExtraction]:
         """
         Process text into chunks and extract entities and relations.
         
         Args:
             text: 输入文本
             doc_id: 文档ID
+            title: 文档标题（可选）
         Returns:
             List[ChunkExtraction]: 抽取结果列表
         """
         # 清理文本
         text = self.processor.clean(text)
+        logging.info(f"[DEBUG] process_text called with doc_id={doc_id}, title={title}")
         
         # 分割成块
         chunks = self.processor.split_into_chunks(text)
@@ -267,7 +271,16 @@ class KnowledgeGraphBuilder:
             extractions.append(extraction)
             
             # 保存元数据和抽取结果
-            self.chunk_meta[chunk_id] = {"doc": doc_id, "start": start, "end": end}
+            logging.info(f"[DEBUG] Creating metadata for chunk {chunk_id} with title={title}")
+            meta = {
+                "doc": doc_id,
+                "title": title,  # Add title to metadata
+                "start": start,
+                "end": end
+            }
+            logging.info(f"[DEBUG] Metadata before storage: {meta}")
+            self.chunk_meta[chunk_id] = meta
+            logging.info(f"[DEBUG] Metadata after storage: {self.chunk_meta[chunk_id]}")
             self.extractions[chunk_id] = extraction
             
             # 生成嵌入向量
@@ -280,20 +293,22 @@ class KnowledgeGraphBuilder:
             
         return extractions
     
-    def process_document(self, doc_id: str, text: str, extractor=None):
+    def process_document(self, doc_id: str, text: str, title: str = None, extractor=None):
         """
         处理单个文档
         
         Args:
             doc_id: 文档ID
             text: 文档文本
+            title: 文档标题（可选）
             extractor: DeepSeek抽取器实例（可选）
         """
         if extractor is None:
             extractor = self.extractor
             
         # 处理文本
-        self.process_text(text, doc_id)
+        logging.info(f"[DEBUG] process_document called with doc_id={doc_id}, title={title}")
+        self.process_text(text, doc_id, title)
         
         logging.info(f"Processed document {doc_id}")
     
@@ -375,9 +390,7 @@ class KnowledgeGraphBuilder:
     
     def save_graph(self, path_prefix: str):
         """Save metadata and FAISS index to disk"""
-        import pickle
-        import faiss
-
+        logging.info(f"[DEBUG] Saving chunk_meta with titles: {[(k, v.get('title')) for k, v in self.chunk_meta.items()]}")
         metadata = {
             "chunk_meta": self.chunk_meta,
             "extractions": self.extractions,
@@ -428,6 +441,7 @@ class KnowledgeGraphBuilder:
 
         # Step 3: Restore internal state
         kg_builder.chunk_meta = metadata["chunk_meta"]
+        logging.info(f"[DEBUG] Loaded chunk_meta with titles: {[(k, v.get('title')) for k, v in kg_builder.chunk_meta.items()]}")
         kg_builder.extractions = metadata["extractions"]
         kg_builder.embeddings = metadata["embeddings"]
         kg_builder.index.entity_name_to_id = metadata["entity_name_to_id"]
@@ -444,63 +458,165 @@ class KnowledgeGraphBuilder:
         print(f"[✓] Knowledge graph loaded from {path_prefix}.pkl and {path_prefix}.faiss")
         return kg_builder
 
+    def validate_entity_extraction(self, query: str) -> None:
+        """
+        Validate entity extraction from a query.
+        
+        Args:
+            query: The input query to validate
+        """
+        print("\n=== Entity Extraction Validation ===")
+        print(f"Query: {query}")
+        
+        # Extract entities and relations
+        entities, relations = self.extractor.extract_chunk(query)
+        
+        print("\nExtracted Entities:")
+        for entity in entities:
+            print(f"- Name: {entity.entity_name}")
+            print(f"  Type: {entity.entity_type}")
+            print(f"  Description: {entity.entity_description}")
+            print()
+            
+        print("\nExtracted Relations:")
+        for relation in relations:
+            print(f"- Source: {relation.source_entity}")
+            print(f"  Relation: {relation.relation}")
+            print(f"  Target: {relation.target_entity}")
+            print(f"  Description: {relation.relation_description}")
+            print()
 
+    def validate_embeddings(self, query: str) -> None:
+        """
+        Validate embedding generation for a query.
+        
+        Args:
+            query: The input query to validate
+        """
+        print("\n=== Embedding Validation ===")
+        print(f"Query: {query}")
+        
+        # Generate embeddings
+        query_embedding = self.entity_embedder.encode(
+            query,
+            normalize_embeddings=True,
+            convert_to_numpy=True
+        ).astype(np.float32)
+        
+        print(f"\nEmbedding shape: {query_embedding.shape}")
+        print(f"Embedding norm: {np.linalg.norm(query_embedding)}")
+        
+        # Test similarity with some known entities
+        if self.index.entity_vectors:
+            similarities = []
+            for entity_id, entity_name in self.index.entity_id_to_name.items():
+                if entity_id < len(self.index.entity_vectors):
+                    entity_vec = self.index.entity_vectors[entity_id]
+                    similarity = np.dot(query_embedding, entity_vec) / (
+                        np.linalg.norm(query_embedding) * np.linalg.norm(entity_vec)
+                    )
+                    similarities.append((entity_name, similarity))
+            
+            # Sort by similarity
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            
+            print("\nTop 5 most similar entities:")
+            for entity_name, similarity in similarities[:5]:
+                print(f"- {entity_name}: {similarity:.3f}")
+
+    def validate_index(self) -> None:
+        """
+        Validate the knowledge graph index.
+        """
+        print("\n=== Index Validation ===")
+        
+        print("\nEntity Statistics:")
+        print(f"Total entities: {len(self.index.entity_id_to_name)}")
+        print(f"Total relations: {len(self.index.relation_name_to_id)}")
+        
+        print("\nEntity-Relation Mapping:")
+        for entity_id, relations in self.index.entity_to_relations.items():
+            entity_name = self.index.entity_id_to_name.get(entity_id, "Unknown")
+            print(f"\nEntity: {entity_name}")
+            for rel_id in relations:
+                rel_name = self.index.relation_name_to_id.get(rel_id, "Unknown")
+                chunks = self.index.entity_relation_to_chunks.get((entity_id, rel_id), set())
+                print(f"- Relation: {rel_name}")
+                print(f"  Connected chunks: {len(chunks)}")
+        
+        if self.index.entity_index:
+            print("\nFAISS Index Statistics:")
+            print(f"Total vectors: {self.index.entity_index.ntotal}")
+            print(f"Dimension: {self.index.entity_index.d}")
 
 def main():
-    """主函数：演示如何使用知识图谱构建系统"""
-    # 设置日志
+    """Main function: Demonstrates how to use the knowledge graph builder"""
+    # Set up logging
     logging.basicConfig(format='%(asctime)s - %(message)s',
                        datefmt='%Y-%m-%d %H:%M:%S',
                        level=logging.INFO)
     
-    # 初始化组件
-    api_key = ""
-    kg_builder = KnowledgeGraphBuilder(api_key=api_key)
+    # Initialize components
+    kg_builder = KnowledgeGraphBuilder(api_key=API_KEY)
     
-    # 加载数据
-    '''
-    DATASET = "nfcorpus"
-    url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{DATASET}.zip"
-    out_dir = os.path.join(os.getcwd(), "datasets")
-    data_path = util.download_and_unzip(url, out_dir)
-    corpus, *_ = GenericDataLoader(data_folder=data_path).load(split="train")
+    # 获取当前脚本所在目录
+    current_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # 处理文档（示例只处理前3个文档）
-    for doc_id, record in list(corpus.items())[:3]:
-        kg_builder.process_document(doc_id, record["text"])
-    '''
-    corpus_file = "./fiqa/corpus.jsonl"
-    max_docs = 200
-    with open(corpus_file, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):  # start counter at 1
-            if i > max_docs:
-                break
-            record = json.loads(line)
-            doc_id = record["_id"]
-            text = record["text"]
-            kg_builder.process_document(doc_id, text)
+    # 加载train.json
+    train_path = os.path.join(current_dir, "datasets", "MultiHopRAG", "train.json")
+    print(f"Loading train data from: {train_path}")
+    with open(train_path, 'r', encoding='utf-8') as f:
+        train_data = json.load(f)
+    
+    # 加载corpus.json
+    corpus_path = os.path.join(current_dir, "datasets", "MultiHopRAG", "corpus.json")
+    print(f"Loading corpus data from: {corpus_path}")
+    with open(corpus_path, 'r', encoding='utf-8') as f:
+        corpus_data = json.load(f)
+    
+    # 创建标题到文档的映射
+    corpus_by_title = {doc['title']: doc for doc in corpus_data}
+    
+    # 处理前MAX_PROCESSED_SAMPLES条evidence_list
+    print(f"\nProcessing first {MAX_PROCESSED_SAMPLES} evidence lists...")
+    processed_count = 0
+    seen_titles = set()
+    for sample in train_data[:MAX_PROCESSED_SAMPLES]:           # 只取前 3 个样本
             
-            if i % 1000 == 0:
-                print(f"Processed {i} documents...")
-
-
-    
+        for evidence in sample['evidence_list']:
+            title = evidence['title']
+            if title in seen_titles:        # 避免同一篇重复处理
+                continue
+            seen_titles.add(title)
+            if title not in corpus_by_title:
+                continue
+            logging.info(f"[DEBUG] Processing evidence with title: {title}")
+            doc = corpus_by_title[title]
+            doc_id = f"doc_{processed_count}"
+                
+            # 将文章信息组合成文本
+            text = f"Title: {doc['title']}\nAuthor: {doc['author']}\nSource: {doc['source']}\nCategory: {doc['category']}\nPublished: {doc['published_at']}\nFact: {doc['body']}"
+            print(f"\nProcessing document {processed_count + 1}:")
+            print(f"Title: {doc['title']}")
+            logging.info(f"[DEBUG] Calling process_document with doc_id={doc_id}, title={doc['title']}")
+            kg_builder.process_document(doc_id, text, title=doc['title'])
+            processed_count += 1
     
     # 构建索引
+    print("\nBuilding knowledge graph index...")
     kg_builder.build_index()
-    #chunks = kg_builder.index.find_chunks_for_entity("statins")
-    #print(f"Chunks for 'statins': {chunks}")
-    # 可视化知识图谱
-    kg_builder.visualize()
-    # Save the built knowledge graph
-    kg_builder.save_graph("saved/graph_fiqa")
-
     
-    # 测试查询
-    query = "Requirements for filing business taxes?"
-    results = kg_builder.query_graph(query)
-    print(f"Query: {query}")
-    print("Results:", results)
+    # 可视化知识图谱
+    output_file = os.path.join(current_dir, "knowledge_graph.html")
+    print(f"\nGenerating visualization...")
+    kg_builder.visualize(output_file=output_file)
+    
+    # Save the built knowledge graph
+    save_dir = os.path.join(current_dir, "saved")
+    os.makedirs(save_dir, exist_ok=True)
+    print("\nSaving knowledge graph...")
+    kg_builder.save_graph(os.path.join(save_dir, "graph"))
+    print("Done!")
 
 if __name__ == "__main__":
     main()

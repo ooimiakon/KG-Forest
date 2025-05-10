@@ -6,10 +6,16 @@ from sentence_transformers import SentenceTransformer
 from kg_forest_new import KnowledgeGraphBuilder, DeepSeekExtractor, Entity, Relation, ChunkExtraction
 import numpy as np
 import sys
+import pandas as pd
+from datasets import load_from_disk
 
-API_KEY = "sk-2c14fbdaec1645189872267405e3d6a5"
+# Global variables
+DATASET_PATH = "datasets/MultiHopRAG/train.json"
+API_KEY = ""
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 BASE_URL = "https://api.deepseek.com/v1"
+NUM_QUERIES_TO_PROCESS = 3  # Number of queries to process from the dataset
+
 # use this when dynamic creating kg
 #kg_builder = KnowledgeGraphBuilder(api_key=API_KEY, model_name=MODEL_NAME)
 
@@ -174,57 +180,89 @@ def rank_chunks_by_similarity(
     # Step 2: Sort by similarity and return top-k
     return sorted(results, key=lambda x: x["similarity"], reverse=True)[:top_k]
 
+def display_chunk_content(kg_builder, chunk_id: str) -> None:
+    """
+    Display the content of a specific chunk.
+    
+    Args:
+        kg_builder: KnowledgeGraphBuilder instance
+        chunk_id: The ID of the chunk to display
+    """
+    if chunk_id in kg_builder.extractions:
+        # Get the chunk metadata
+        meta = kg_builder.chunk_meta.get(chunk_id, {})
+        logging.info(f"Chunk metadata for {chunk_id}: {meta}")
+        print(f"\nChunk ID: {chunk_id}")
+        print(f"Document ID: {meta.get('doc', 'Unknown')}")
+        print(f"Title: {meta.get('title', 'Unknown')}")
+        print(f"Position: {meta.get('start', 0)}-{meta.get('end', 0)}")
+        
+        # Get the entities and relations
+        # extraction = kg_builder.extractions[chunk_id]
+        # print("\nEntities:")
+        # for entity in extraction.entities:
+        #     print(f"- {entity.entity_name} ({entity.entity_type}): {entity.entity_description}")
+        
+        # print("\nRelations:")
+        # for relation in extraction.relations:
+        #     print(f"- {relation.source_entity} --[{relation.relation}]--> {relation.target_entity}")
+        #     print(f"  Description: {relation.relation_description}")
+    else:
+        print(f"\nChunk {chunk_id} not found in knowledge graph")
+
+def main():
+    """Main function: Demonstrates how to use the knowledge graph query system"""
+    # Set up logging
+    logging.basicConfig(format='%(asctime)s - %(message)s',
+                       datefmt='%Y-%m-%d %H:%M:%S',
+                       level=logging.INFO)
+    
+    # Load saved knowledge graph
+    kg_builder = KnowledgeGraphBuilder.load_graph(api_key=API_KEY, path_prefix="saved/graph")
+    
+    # Load first three queries from MultiHopRAG dataset
+    with open(DATASET_PATH, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    # Process queries
+    for i in range(min(NUM_QUERIES_TO_PROCESS, len(data))):
+        query_data = data[i]
+        query = query_data['query']
+        expected_answer = query_data['answer']
+        
+        print(f"\n{'='*80}")
+        print(f"Query {i+1}:")
+        print(f"Question: {query}")
+        print(f"Expected Answer: {expected_answer}")
+        print(f"{'='*80}")
+        
+        # Extract entities and relations from query
+        entities, relations = extract_entities_and_relations(query)
+        
+        # Execute search with entities and relations
+        results = search_entities_with_optional_relations(kg_builder, entities, relations)
+        
+        # Print results
+        print("\nSearch Results:")
+        all_chunks = set()  # Initialize set to collect all chunks
+        for entity, chunks in results:
+            print(f"{entity}: {chunks}")
+            all_chunks.update(chunks)  # Add chunks to the set
+        
+        # Rank and print chunks by similarity
+        if all_chunks:
+            print("\nRanked Results by Similarity:")
+            ranked_chunks = rank_chunks_by_similarity(kg_builder, query, list(all_chunks))
+            for chunk in ranked_chunks:
+                meta = kg_builder.chunk_meta.get(chunk['chunk_id'], {})
+                print(f"[{chunk['chunk_id']}] similarity={chunk['similarity']:.3f} Title: {meta.get('title', 'Unknown')}")
+            
+            # Display content of each chunk
+            # print("\nDetailed Chunk Contents:")
+            # for chunk in ranked_chunks:
+            #     display_chunk_content(kg_builder, chunk['chunk_id'])
+        
+        print("\n")
 
 if __name__ == "__main__":
-    # chane this for 
-    #query = "What is the big deal about the chinese remnibi trading hub that opened in toronto"
-    query = sys.argv[1]
-    print(f"Query: {query}")
-    entities, relations = extract_entities_and_relations(query)
-
-    #hard coded for testing
-    '''entities = [
-        {'entity_name': 'breast cancer patient group', 'entity_type': 'Organization', 'entity_description': 'Patient group mentioned in the query'},
-        {'entity_name': "breast cancer patients' group", 'entity_type': 'Organization', 'entity_description': 'Group mentioned in the query'},
-        {'entity_name': 'breast cancer patient collective', 'entity_type': 'Organization', 'entity_description': 'A collective of patients affected by breast cancer'}
-    ]
-
-    relations = [
-        {'source_entity': 'Unknown organization', 'relation': 'linked_to', 'target_entity': 'breast cancer patient group', 'relation_description': 'Organizations associated with the breast cancer patient group'},
-        {'source_entity': 'Unknown organization', 'relation': 'connected_to', 'target_entity': "breast cancer patients' group", 'relation_description': "Organizations linked to the breast cancer patients' group"},
-        {'source_entity': 'Unknown groups or associations', 'relation': 'tied_to', 'target_entity': 'breast cancer patient collective', 'relation_description': 'Groups or associations linked to the breast cancer patient collective'}
-    ]'''
-    results = search_entities_with_optional_relations(kg_builder, entities, relations)
-
-    all_chunk_ids = list({cid for _, chunk_list in results for cid in chunk_list})
-    top_chunks = rank_chunks_by_similarity(
-    kg_builder,
-    query_text= query,
-    chunk_ids=all_chunk_ids,
-    top_k=10
-    )
-
-    # 4. Print
-    for chunk in top_chunks:
-        print(f"[{chunk['chunk_id']}] similarity={chunk['similarity']:.3f}")
-
-    '''
-Search Results:
-breast cancer patients: ['MED-10#2']
-breast cancer: ['MED-10#1']
-breast cancer diagnosis: ['MED-14#2']
-cohort of 17,880 breast cancer patients: ['MED-14#0']
-breast cancer patients: ['MED-10#0']
-cohort of 17,880 breast cancer patients: ['MED-14#0']
-breast cancer: ['MED-14#1']
-breast cancer diagnosis: ['MED-14#2']
-breast cancer patients: ['MED-10#0']
-breast cancer: ['MED-10#1']
-breast cancer diagnosis: ['MED-14#2']
-cohort of 17,880 breast cancer patients: ['MED-14#0']
-[MED-14#0] similarity=0.412
-[MED-10#0] similarity=0.411
-[MED-14#1] similarity=0.385
-[MED-14#2] similarity=0.377
-[MED-10#1] similarity=0.333
-[MED-10#2] similarity=0.323'''
+    main()
